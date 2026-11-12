@@ -21,8 +21,13 @@ server. This source-only contribution separates their changes.
 
 ## Verified versions
 
-The real Windows game session used PS4 DriveClub 1.28, an isolated installation
-whose directory was originally labeled 0.2.4, and a patched runtime built
+The reporter verified the deployed patch in a Windows DriveClub Recomp v0.4.2
+installation with PS4 DriveClub 1.28. Badge saving, the editor, car liveries
+and menu previews worked, including after restarting the game. Both preview
+sizes contained valid image data.
+
+The verified isolated Windows game session used PS4 DriveClub 1.28
+and a patched runtime built
 from DriveClub Recomp commit `ca23464e2d9d2cc8bd887a243d5805d5d492baa3`.
 Both previews had nontransparent pixels (36,770 at 256×256 and 2,384 at 64×64).
 Encoder, SQLite and download SHA-256 hashes matched and the upload request
@@ -30,13 +35,13 @@ checksums matched the stored files. The user confirmed the badge remained
 visible after restarting the client and server.
 
 The upstream [v0.4.2 hotfix](https://github.com/OverkillLabs3/driveclub-recomp/releases/tag/v0.4.2)
-is commit `e9d32b868c436de77dd0a21cc145e03e199db531`. Its tracked code matches
-the verified client base. The upstream tag contains the encoder NID names
+is commit `e9d32b868c436de77dd0a21cc145e03e199db531`. Only the upstream README
+differs from the verified client base. The upstream tag contains the encoder NID names
 but lacks the HLE implementation and badge-specific readback. The patches
 applied cleanly to this tag and a fresh Windows build linked and started
 far enough to print usage. The prepared 1.28 image passed the signature check.
-The fresh tag build has yet to complete an in-game badge save. Other releases
-and Linux have not been tested for this fix.
+The fresh tag build is a separate artifact and has yet to complete its own
+in-game badge save. Game versions other than 1.28 and Linux remain untested.
 
 The tested server base is
 [Judaswick/driveclub-server coop](https://github.com/Judaswick/driveclub-server/tree/2233b4cbc168d086c186fac830e415a0d66bcbe1)
@@ -66,6 +71,11 @@ git -C server-review switch -c fix/club-badge-server 2233b4cbc168d086c186fac830e
 & "$bundle/check-update.ps1" -Checkout ./server-review -Component Server
 & "$bundle/check-update.ps1" -Checkout ./server-review -Component Server -Apply
 ```
+
+The server patches target Judaswick's `coop` branch, which carries the EGS
+layout used for validation. The parent `shad-net/driveclub-server` repository
+has no `coop` branch. Review schema and handler differences before adapting
+the server patches to another branch.
 
 Stop if Git reports a conflict or the game signature changes. The script skips
 patches that reverse-apply verbatim and stops on ambiguous changes. For an
@@ -106,6 +116,10 @@ nonempty badge in the real isolated game on port 18080. Enable
 `BB_BADGE_PIXELS=1` and server request tracing for that run. The variable is
 optional for ordinary play.
 
+Run the schema test from the same CLANG64 environment used to build it. If
+using PowerShell, add that environment's `bin` directory to the session
+`PATH` so Windows can load the matching Protobuf and Abseil DLLs.
+
 ```powershell
 python tools/test_club_badge_server.py --server ../server-review/out/driveclubsrv.exe --schema-check out/club_badge_schema_test.exe
 python tools/check_club_badge_pixels.py --test-root ./out/club-badge-game-test --club 1 --client-log ./out/club-badge-game-test/logs/SAVE-RUN.stderr.log
@@ -118,10 +132,12 @@ available until the new client and server pass the entire test.
 
 ## Credits and license
 
-The PNG encoder is adapted from [shadPS4's libScePngEnc implementation](https://github.com/shadps4-emu/shadPS4/blob/main/src/core/libraries/libpng/pngenc.cpp).
+The PNG encoder is adapted from shadPS4's libScePngEnc implementation
+introduced in [shadPS4 commit 4f11a8c](https://github.com/shadps4-emu/shadPS4/commit/4f11a8c979de05cc97a236c2346c0f3343dc4034).
 The imported source retains the shadPS4 Emulator Project copyright and
-`GPL-2.0-or-later` SPDX notices. The exact donor revision was not recorded
-in the original import. The DriveClub Recomp source is distributed with its
+`GPL-2.0-or-later` SPDX notices. The imported implementation matches that
+revision after accounting for local includes and diagnostics. The exact
+checkout used during the original import is unrecorded. The DriveClub Recomp source is distributed with its
 repository GPL license. Server patches are intended for the server repository
 under its existing licensing terms. The contribution contains source patches
 and test code. The game and runtime data are supplied separately by testers.
