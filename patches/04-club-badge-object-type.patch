@@ -1,0 +1,13 @@
+diff --git a/proto/egs.proto b/proto/egs.proto
+--- a/proto/egs.proto
++++ b/proto/egs.proto
+@@ -248,6 +248,9 @@
+ enum BobObjectType {
+   BOB_OBJECT_TYPE_0 = 0;
+   BOB_OBJECT_TYPE_GHOST = 1;
++  // Game 1.28: +0xbac530 uploads both club badge PNGs with objectType=5
++  // (+0xbac67b). The client resolves this enum from our advertised descriptor.
++  BOB_OBJECT_TYPE_CLUB_BADGE = 5;
+ }
+ 
+ enum BobAccessType {

@@ -1,0 +1,154 @@
+diff --git a/gpu/bbgpu.h b/gpu/bbgpu.h
+index 2c42a53..5bc367b 100644
+--- a/gpu/bbgpu.h
++++ b/gpu/bbgpu.h
+@@ -27,6 +27,7 @@ void bbgpu_shutdown(void);
+ uintptr_t bbgpu_resolve(const char *scoped_nid);
+ /* Called first by the loader's SIGSEGV handler: 1 when a GPU page-tracking fault was handled. */
+ int bbgpu_handle_fault(void *ucontext, void *address);
++int bbgpu_sync_badge_texture(uintptr_t address);
+ /* BB_WRITE_LOG=1: prints the logged GPU-side writes to guest memory near the fault. */
+ void bbgpu_dump_guest_writes(void *ucontext);
+ /* Keyboard text entry through the game window (IME dialog). begin returns 0 when
+diff --git a/gpu/shadps4/video_core/texture_cache/texture_cache.cpp b/gpu/shadps4/video_core/texture_cache/texture_cache.cpp
+index d0a24fb..8e8def8 100644
+--- a/gpu/shadps4/video_core/texture_cache/texture_cache.cpp
++++ b/gpu/shadps4/video_core/texture_cache/texture_cache.cpp
+@@ -78,6 +78,48 @@ TextureCache::TextureCache(const Vulkan::Instance& instance_, Vulkan::Scheduler&
+ 
+ TextureCache::~TextureCache() = default;
+ 
++bool TextureCache::SyncBadgeTexture(VAddr address) {
++    const auto id = FindImageFromRange(address, 0);
++    if (!id) {
++        return false;
++    }
++    auto& image = slot_images[id];
++    const auto& info = image.info;
++    // This guest call reads a single 32-bit 2D surface. Preserve its tiled layout
++    // for the game's CPU conversion, using the same tiler as GPU buffer aliases.
++    if (info.props.is_depth || info.props.is_block || info.num_bits != 32 ||
++        info.num_samples != 1 || info.resources.layers != 1 || info.resources.levels != 1 ||
++        info.size.depth != 1 || info.size.width != info.size.height ||
++        (info.size.width != 64 && info.size.width != 256) ||
++        !Core::Memory::Instance()->IsValidMapping(address, info.guest_size)) {
++        return false;
++    }
++    const auto& mip = info.mips_layout[0];
++    vk::BufferImageCopy region{
++        .bufferOffset = mip.offset,
++        .bufferRowLength = mip.pitch,
++        .bufferImageHeight = mip.height,
++        .imageSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
++        .imageExtent = {info.size.width, info.size.height, 1},
++    };
++    const auto staging = runtime.GetStagingPool().Request(
++        info.guest_size, MemoryType::HostCached, instance.StorageMinAlignment());
++    tile_manager.TileImage(image, std::span{&region, 1}, staging.buffer, staging.offset);
++    scheduler.RequestHostReadBarrier();
++    scheduler.Finish(6);
++    staging.Invalidate();
++    const bool written = Core::Memory::Instance()->TryWriteBacking(
++        std::bit_cast<u8*>(address), staging.mapped, info.guest_size);
++    if (const char* trace = std::getenv("BB_BADGE_PIXELS"); trace && trace[0] == '1') {
++        const size_t nonzero = std::count_if(staging.mapped, staging.mapped + info.guest_size,
++                                             [](u8 value) { return value != 0; });
++        std::fprintf(stderr, "BADGE_SURFACE source=%#llx %ux%u tiled=%d nonzeroBytes=%zu written=%d\n",
++                     static_cast<unsigned long long>(address), info.size.width, info.size.height,
++                     int(info.IsTiled()), nonzero, int(written));
++    }
++    return written;
++}
++
+ void TextureCache::ProcessDownloadImages() {
+     std::unique_lock lk{download_images_mutex};
+     // A fence does not wait for the GPU: each linear image is copied into its own staging buffer and
+diff --git a/gpu/shadps4/video_core/texture_cache/texture_cache.h b/gpu/shadps4/video_core/texture_cache/texture_cache.h
+index dd339c7..a54f427 100644
+--- a/gpu/shadps4/video_core/texture_cache/texture_cache.h
++++ b/gpu/shadps4/video_core/texture_cache/texture_cache.h
+@@ -128,6 +128,7 @@ public:
+ 
+     /// Schedules a copy of pending images for download back to CPU memory.
+     void ProcessDownloadImages();
++    bool SyncBadgeTexture(VAddr address);
+ 
+     /// Retrieves the image handle of the image with the provided attributes.
+     [[nodiscard]] ImageId FindImage(ImageDesc& desc, bool exact_fmt = false);
+diff --git a/gpu/shim/bbgpu.cpp b/gpu/shim/bbgpu.cpp
+index cedf253..5599e46 100644
+--- a/gpu/shim/bbgpu.cpp
++++ b/gpu/shim/bbgpu.cpp
+@@ -383,6 +383,18 @@ extern "C" int bbgpu_handle_fault(void* ucontext, void* address) {
+     return Core::Signals::Instance()->DispatchAccessViolation(ucontext, address) ? 1 : 0;
+ }
+ 
++extern "C" int bbgpu_sync_badge_texture(uintptr_t address) {
++    auto* rasterizer = Core::Memory::Instance()->GetRasterizer();
++    if (!liverpool || !rasterizer || g_gpu_shutdown_complete) {
++        return 0;
++    }
++    bool written = false;
++    liverpool->SendCommand<true>([&] {
++        written = rasterizer->GetTextureCache().SyncBadgeTexture(address);
++    });
++    return written;
++}
++
+ extern "C" void bbgpu_print_recent_passes(void) {
+     if (BbRecent::crumb) {
+         // The GPU's own count of the work its command processor reached: the faulting draw is this one or
+diff --git a/src/probe.c b/src/probe.c
+index 4b03539..0d6fb0a 100644
+--- a/src/probe.c
++++ b/src/probe.c
+@@ -780,6 +780,41 @@ static void patch_shared_alloc(unsigned char *image, uint64_t size) {
+     protect(thunks, page_size, 5);
+     printf("BB_SHARED_LOG/PAD: %d SystemShared allocator sites patched (log %d, pad %d)\n", patched, log, padding);
+ }
++/* The PNG export reads a GPU texture through the game's CPU surface converter. */
++static uintptr_t badge_convert_target;
++static ABI int badge_convert_surface(void *layout, void *pixels, const void *texture) {
++    const int written = bbgpu_sync_badge_texture((uintptr_t)texture);
++    const char *trace = getenv("BB_BADGE_PIXELS");
++    if (trace && trace[0]=='1')
++        fprintf(stderr,"BADGE_CONVERT source=%p output=%p synchronized=%d\n",texture,pixels,written);
++    const uint64_t args[] = {(uintptr_t)layout, (uintptr_t)pixels, (uintptr_t)texture};
++    return (int)guest_cpu_call(badge_convert_target, 3, args);
++}
++static void patch_badge_readback(unsigned char *image, uint64_t size) {
++    const char *enabled=getenv("BB_BADGE_READBACK");
++    if (enabled && enabled[0]=='0') return;
++    const uint64_t site_offset=0x791f05, target_offset=0xb4a190;
++    static const unsigned char signature[]={
++        0x4c,0x89,0xff,0x4c,0x89,0xee,0x48,0x89,0xda,
++        0xe8,0x86,0x82,0x3b,0x00,0x85,0xc0
++    };
++    if (size<=target_offset || memcmp(image+site_offset-9,signature,sizeof signature)) return;
++    unsigned char *site=image+site_offset, *thunk=allocate_code(page_size);
++    const int64_t to=(int64_t)((uintptr_t)thunk-((uintptr_t)site+5));
++    if (to!=(int32_t)to) {
++        protect(thunk,page_size,5);
++        return;
++    }
++    badge_convert_target=(uintptr_t)image+target_offset;
++    const uintptr_t hook=host_entry((uintptr_t)badge_convert_surface);
++    thunk[0]=0x48; thunk[1]=0xb8; memcpy(thunk+2,&hook,8);
++    thunk[10]=0xff; thunk[11]=0xe0;
++    protect(thunk,page_size,5);
++    const int32_t rel=(int32_t)to;
++    memcpy(site+1,&rel,4);
++    puts("Club Badge: synchronize the source texture before CPU surface conversion");
++}
++
+ /* BB_EXPOSURE_STALE=1 (opt-in; gpu/shadps4/video_core/page_manager.cpp): the auto-exposure's two histogram copies
+  * (eboot 0x702ad2 and 0x702afc: mov edx, 0x400; call memcpy 0x123e3b0) and its value read (0x702b0d: xor ecx, ecx;
+  * call getter 0x758980) call host hooks through near thunks (movabs rax, hook; jmp rax): same arguments, and they
+@@ -1659,6 +1694,7 @@ int main(int argc, char **argv) {
+     if (!cpu_only) apply_ui_resolution(image, size);
+     if (!cpu_only) apply_cull_scale(image, size);
+     if (!cpu_only) patch_shared_alloc(image, size);
++    if (!cpu_only) patch_badge_readback(image, size);
+     if (!cpu_only && !patch_exposure_exact(image, size)) patch_exposure_copy(image, size);
+     if (!cpu_only) patch_cloud_get(image, size);
+     if (!cpu_only) patch_query_get(image, size);
